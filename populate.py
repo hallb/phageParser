@@ -27,10 +27,8 @@ from restapi.models import (
     Locus
 )
 
-DATA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'data'))
 
-
-def populate_organism():
+def populate_organism(data_dir):
     def add_organism(name, accession):
         # get the object, this also checks for duplicates
         o, created = Organism.objects.get_or_create(
@@ -54,53 +52,66 @@ def populate_organism():
                 acc_name_dict[record.name] = record.annotations['organism']
         return acc_name_dict
 
-    with open(os.path.join(DATA_DIR, 'bac_accession_list.txt')) as f:
-        acc_name_dict = list(read_accession_file(f))
+    with open(os.path.join(data_dir, 'bac_accession_list.txt')) as f:
+        accession_list = list(read_accession_file(f))
 
-    # acc_name_dict = merge_acc_names(accession_list)
+    acc_name_dict = merge_acc_names(accession_list)
     for acc in acc_name_dict:
         add_organism(name=acc_name_dict[acc], accession=acc)
 
 
-def get_spacer_repeat_files():
-    spath = os.path.join(DATA_DIR, "spacerdatabase.txt")
-    surl = ('http://crispr.i2bc.paris-saclay.fr/'
-            'crispr/BLAST/Spacer/Spacerdatabase')
-    rpath = os.path.join(DATA_DIR, "repeatdatabase.txt")
-    rurl = 'http://crispr.i2bc.paris-saclay.fr/crispr/BLAST/DR/DRdatabase'
-    fetch.fetch(spath, surl)
-    fetch.fetch(rpath, rurl)
-    return spath, rpath
+class FastaFetcher:
+    def __init__(self, url, filename, limit=-1):
+        self.limit = limit
+        self.url = url
+        self.filename = filename
+
+    def fasta_records(self):
+        fetch.fetch(self.filename, self.url)
+        result = list(SeqIO.parse(self.filename, 'fasta'))
+        if self.limit > -1:
+            return result[:self.limit]
+        return result
 
 
-def repeatfiletodict(rfile):
-    rdict = {}
-    repeatrecords = SeqIO.parse(rfile, 'fasta')
-    for record in repeatrecords:
-        accessions = record.name.split('|')
-        sequence = str(record.seq)
-        for acc in accessions:
-            rdict[acc] = {'RepeatSeq': sequence}
-    return rdict
+def initialize_spacer_and_repeat_fetchers(data_dir, limit):
+    spacer_fetcher = FastaFetcher(
+        'http://crispr.i2bc.paris-saclay.fr/crispr/BLAST/Spacer/Spacerdatabase',
+        os.path.join(data_dir, 'spacerdatabase.txt'),
+        limit=limit)
+    repeat_fetcher = FastaFetcher(
+        'http://crispr.i2bc.paris-saclay.fr/crispr/BLAST/DR/DRdatabase',
+        os.path.join(data_dir, 'repeatdatabase.txt'),
+        limit=limit)
+    return spacer_fetcher, repeat_fetcher
 
 
-def addspacerstodict(gendict, sfile):
-    spacerrecords = SeqIO.parse(sfile, 'fasta')
-    for record in spacerrecords:
-        accessions = record.name.split('|')
-        sequence = str(record.seq)
-        for acc in accessions:
-            acc_elems = acc.split('_')
-            order = acc_elems[-1]
-            acc_id = '_'.join(acc_elems[:-1])
+def repeat_records_to_dict(repeat_records):
+    repeat_dict = {}
+    for repeat in repeat_records:
+        accession_list = repeat.name.split('|')
+        sequence = str(repeat.seq)
+        for accession in accession_list:
+            repeat_dict[accession] = {'RepeatSeq': sequence}
+    return repeat_dict
+
+
+def add_spacers_to_dict(gene_dict, spacer_records):
+    for spacer in spacer_records:
+        accession_list = spacer.name.split('|')
+        sequence = str(spacer.seq)
+        for accession in accession_list:
+            accession_elements = accession.split('_')
+            order = accession_elements[-1]
+            accession_id = '_'.join(accession_elements[:-1])
             try:
-                if 'Spacers' in gendict[acc_id]:
-                    gendict[acc_id]['Spacers'][order] = sequence
+                if 'Spacers' in gene_dict[accession_id]:
+                    gene_dict[accession_id]['Spacers'][order] = sequence
                 else:
-                    gendict[acc_id]['Spacers'] = {order: sequence}
+                    gene_dict[accession_id]['Spacers'] = {order: sequence}
             except KeyError:
-                print('Error on accession id:  %s' % acc_id)
-    return gendict
+                print('Error on accession id:  %s' % accession_id)
+    return gene_dict
 
 
 def addpositionstodict(gendict):
@@ -159,25 +170,25 @@ def populate_fromlocus(locid, locdict):
     organism.save()
 
 
-def populate_lsrpair():
+def populate_lsrpair(data_dir, limit):
     print('Downloading files and gathering online data.')
-    sfile, rfile = get_spacer_repeat_files()
+    spacer_fetcher, repeat_fetcher = initialize_spacer_and_repeat_fetchers(data_dir, limit)
     gendict = prune_dict(
         addpositionstodict(
-            addspacerstodict(
-                repeatfiletodict(rfile), sfile)))
-    with open('dbbackups/genedict.pickle', 'rb') as f:
+            add_spacers_to_dict(
+                repeat_records_to_dict(repeat_fetcher.fasta_records()),
+                spacer_fetcher.fasta_records())))
+    with open(os.path.join(data_dir, 'gene_dict.pickle'), 'wb') as f:
         pickle.dump(gendict, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    print('Created dictionary and dumped data to genedict.pickle')
-    print("Populating Spacer, Repeat, SpacerRepeatPair, "
-          "OrganismSpacerRepeatPair tables")
+    print('Created dictionary and dumped data to gene_dict.pickle')
+    print('Populating Spacer, Repeat, SpacerRepeatPair, OrganismSpacerRepeatPair tables')
     for locid in tqdm(gendict):
         populate_fromlocus(locid, gendict[locid])
 
 
-def populate_anticrispr():
-    with open(os.path.join(DATA_DIR, 'antiCRISPR_accessions.txt')) as f:
+def populate_anticrispr(data_dir):
+    with open(os.path.join(data_dir, 'antiCRISPR_accessions.txt')) as f:
         accession_list = list(read_accession_file(f))
     print("Fetching AntiCRISPR entries")
     result_handle = Entrez.efetch(
@@ -189,27 +200,29 @@ def populate_anticrispr():
         spacer.save()
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Populate the phageParser database with data from NCBI'
-    )
-    parser.add_argument(
-        'email',
-        nargs=1,
-        help=('your email address (does not need to be registered, '
-              'just used to identify you)')
-    )
-    args = parser.parse_args()
-
-    Entrez.email = args.email
-
+def main(email, data_dir, limit):
+    Entrez.email = email
     print("Starting organism population")
-    populate_organism()
+    populate_organism(data_dir)
     print("Starting LSR population")
-    populate_lsrpair()
+    populate_lsrpair(data_dir, limit)
     print("Starting AntiCRISPR population")
-    populate_anticrispr()
+    populate_anticrispr(data_dir)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='Populate the phageParser database with data from NCBI')
+    parser.add_argument('email', nargs=1,
+                        help='your email address (does not need to be registered, just used to identify you)')
+    parser.add_argument('data_dir', nargs=1, default='data',
+                        help='a directory for input and temporary files')
+    parser.add_argument('test_limit', nargs=1, default=-1,
+                        help='useful for limiting the size of the test set')
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    main()
+    args = parse_arguments()
+    data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), args.data_dir))
+    main(args.email, data_dir, args.limit)
